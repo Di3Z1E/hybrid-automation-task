@@ -1,0 +1,111 @@
+- name: Generate and deploy certificates with CA
+  hosts: windows
+  gather_facts: no
+  vars:
+    cert_subject: "CN=splunk.rafael.local"
+    cert_password: "123qweA"
+    cert_path: "C:\\temp\\splunk.pfx"
+    ca_cert_path: "C:\\temp\\ca-cert.cer"
+    
+  tasks:
+    - name: Create temporary directory
+      ansible.windows.win_file:
+        path: C:\temp
+        state: directory
+
+    - name: Generate self-signed CA certificate first
+      ansible.windows.win_powershell:
+        script: |
+          try {
+            # Create CA certificate
+            $caCert = New-SelfSignedCertificate `
+              -Subject "CN=RAFAEL-CA" `
+              -CertStoreLocation "Cert:\LocalMachine\My" `
+              -KeyExportPolicy Exportable `
+              -KeyUsage CertSign,CRLSign,DigitalSignature `
+              -KeyUsageProperty All `
+              -KeyLength 4096 `
+              -KeyAlgorithm RSA `
+              -HashAlgorithm SHA256 `
+              -NotAfter (Get-Date).AddYears(10) `
+              -TextExtension @("2.5.29.19={text}CA=true&pathlength=3")
+            
+            # Export CA certificate to file
+            Export-Certificate -Cert $caCert -FilePath "{{ ca_cert_path }}" -Force
+            
+            # Import CA into Trusted Root
+            Import-Certificate -FilePath "{{ ca_cert_path }}" -CertStoreLocation "Cert:\LocalMachine\Root"
+            
+            $Ansible.Result = @{
+              thumbprint = $caCert.Thumbprint
+              subject = $caCert.Subject
+              status = "success"
+            }
+          } catch {
+            $Ansible.Result = @{
+              status = "failed"
+              error = $_.Exception.Message
+            }
+            $Ansible.Failed = $true
+          }
+      register: ca_generation
+
+    - name: Generate server certificate signed by CA
+      ansible.windows.win_powershell:
+        script: |
+          try {
+            # Find the CA certificate
+            $caCert = Get-ChildItem -Path "Cert:\LocalMachine\My" | 
+              Where-Object {$_.Subject -eq "CN=RAFAEL-CA"} | 
+              Select-Object -First 1
+            
+            if (-not $caCert) {
+              throw "CA certificate not found"
+            }
+            
+            # Create server certificate signed by CA
+            $serverCert = New-SelfSignedCertificate `
+              -Subject "{{ cert_subject }}" `
+              -DnsName @("splunk.rafael.local", "192.168.74.130", "localhost") `
+              -CertStoreLocation "Cert:\LocalMachine\My" `
+              -KeyExportPolicy Exportable `
+              -KeySpec KeyExchange `
+              -KeyLength 2048 `
+              -KeyAlgorithm RSA `
+              -HashAlgorithm SHA256 `
+              -Signer $caCert `
+              -NotAfter (Get-Date).AddYears(2) `
+              -Provider "Microsoft RSA SChannel Cryptographic Provider"
+            
+            # Export with private key
+            $pwd = ConvertTo-SecureString -String "{{ cert_password }}" -Force -AsPlainText
+            Export-PfxCertificate -Cert $serverCert -FilePath "{{ cert_path }}" -Password $pwd -ChainOption BuildChain
+            
+            $Ansible.Result = @{
+              thumbprint = $serverCert.Thumbprint
+              subject = $serverCert.Subject
+              issuer = $serverCert.Issuer
+              status = "success"
+            }
+          } catch {
+            $Ansible.Result = @{
+              status = "failed"
+              error = $_.Exception.Message
+            }
+            $Ansible.Failed = $true
+          }
+      register: cert_generation
+
+    - name: Verify certificate files exist
+      ansible.windows.win_stat:
+        path: "{{ item }}"
+      register: cert_files
+      loop:
+        - "{{ cert_path }}"
+        - "{{ ca_cert_path }}"
+
+    - name: Display certificate generation results
+      ansible.builtin.debug:
+        msg: |
+          CA Certificate: {{ ca_generation.result }}
+          Server Certificate: {{ cert_generation.result }}

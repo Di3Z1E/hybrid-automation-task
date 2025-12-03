@@ -1,0 +1,54 @@
+- name: Finalize setup and validate infrastructure
+  hosts: windows
+  gather_facts: no
+  tasks:
+    - name: Validate all services and generate test traffic
+      ansible.windows.win_powershell:
+        script: |
+          $services = @("ADWS", "CertSvc", "W3SVC", "SplunkForwarder", "DNS", "Netlogon")
+          $failedServices = @()
+          
+          foreach ($service in $services) {
+            $svc = Get-Service -Name $service -ErrorAction SilentlyContinue
+            if (-not $svc -or $svc.Status -ne "Running") {
+              $failedServices += $service
+            }
+          }
+          
+          try {
+            $domain = Get-ADDomain -ErrorAction Stop
+            $adStatus = "healthy"
+          } catch {
+            $adStatus = "failed"
+          }
+          
+          try {
+            $response = Invoke-WebRequest -Uri "http://localhost" -UseBasicParsing
+            $iisStatus = if ($response.StatusCode -eq 200) { "healthy" } else { "failed" }
+          } catch {
+            $iisStatus = "failed"
+          }
+          
+          $certExists = Test-Path "C:\temp\splunk.pfx"
+          
+          $Ansible.Result = @{
+            failed_services = $failedServices
+            ad_status = $adStatus
+            iis_status = $iisStatus
+            cert_exists = $certExists
+            validation_passed = ($failedServices.Count -eq 0 -and $adStatus -eq "healthy" -and $iisStatus -eq "healthy" -and $certExists)
+          }
+      register: validation_result
+
+    - name: Generate test web traffic
+      ansible.windows.win_uri:
+        url: "http://localhost/{{ item }}"
+        method: GET
+      loop: ["index.html", "test1.html", "test2.html"]
+      ignore_errors: yes
+
+    - name: Validation summary
+      ansible.builtin.assert:
+        that: validation_result.result.validation_passed
+        fail_msg: "Validation failed. Check services and configuration."
+        success_msg: "All infrastructure components validated successfully."

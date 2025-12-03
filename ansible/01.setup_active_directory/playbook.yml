@@ -1,0 +1,126 @@
+- name: Setup Active Directory Domain
+  hosts: windows
+  gather_facts: yes
+  vars:
+    domain_name: rafael.local
+    domain_netbios_name: RAFAELDOM
+    computer_name: RAFAELDC
+    safe_mode_password: "123qweA"
+    
+  tasks:
+    - name: Rename computer to {{ computer_name }}
+      ansible.windows.win_hostname:
+        name: "{{ computer_name }}"
+      register: hostname_changed
+
+    - name: Reboot after hostname change
+      ansible.windows.win_reboot:
+        reboot_timeout: 300
+      when: hostname_changed.reboot_required
+
+    - name: Install Active Directory Domain Services feature
+      ansible.windows.win_feature:
+        name: AD-Domain-Services
+        include_management_tools: yes
+        include_sub_features: yes
+        state: present
+      register: adds_install
+
+    - name: Reboot if AD DS installation requires it
+      ansible.windows.win_reboot:
+        reboot_timeout: 300
+      when: adds_install.reboot_required
+
+    - name: Check if server is already a domain controller
+      ansible.windows.win_powershell:
+        script: |
+          Import-Module ADDSDeployment -ErrorAction SilentlyContinue
+          try {
+            $domain = Get-ADDomain -ErrorAction Stop
+            $Ansible.Result = @{
+              is_domain_controller = $true
+              domain_name = $domain.DNSRoot
+            }
+          } catch {
+            $Ansible.Result = @{
+              is_domain_controller = $false
+              domain_name = $null
+            }
+          }
+      register: domain_status
+      failed_when: false
+
+    - name: Create new Active Directory forest
+      microsoft.ad.domain:
+        dns_domain_name: "{{ domain_name }}"
+        domain_netbios_name: "{{ domain_netbios_name }}"
+        safe_mode_password: "{{ safe_mode_password }}"
+        database_path: C:\Windows\NTDS
+        sysvol_path: C:\Windows\SYSVOL
+        create_dns_delegation: no
+        install_dns: yes
+      register: domain_install
+      when: not domain_status.result.is_domain_controller
+
+    - name: Reboot after domain controller promotion
+      ansible.windows.win_reboot:
+        reboot_timeout: 900
+        post_reboot_delay: 120
+      when: 
+        - not domain_status.result.is_domain_controller
+        - domain_install is changed
+
+    - name: Wait for Active Directory Web Services
+      ansible.windows.win_service:
+        name: ADWS
+        state: started
+      register: adws_service
+      until: adws_service is succeeded
+      retries: 10
+      delay: 30
+      when: domain_install is changed
+
+    - name: Wait for DNS service
+      ansible.windows.win_service:
+        name: DNS
+        state: started
+      register: dns_service
+      until: dns_service is succeeded
+      retries: 10
+      delay: 30
+      when: domain_install is changed
+
+    - name: Wait for Netlogon service
+      ansible.windows.win_service:
+        name: Netlogon
+        state: started
+      register: netlogon_service
+      until: netlogon_service is succeeded
+      retries: 10
+      delay: 30
+      when: domain_install is changed
+
+    - name: Verify Active Directory is functional
+      ansible.windows.win_powershell:
+        script: |
+          try {
+            Import-Module ActiveDirectory
+            $domain = Get-ADDomain
+            $dcDiag = dcdiag /test:DNS /v
+            $Ansible.Result = @{
+              domain_name = $domain.DNSRoot
+              domain_mode = $domain.DomainMode
+              forest_mode = $domain.Forest
+              status = "healthy"
+            }
+            $Ansible.Changed = $false
+          } catch {
+            $Ansible.Failed = $true
+            $Ansible.Result = @{
+              status = "failed"
+              error = $_.Exception.Message
+            }
+          }
+      register: ad_verification
+      when: domain_install is changed
+      failed_when: ad_verification.result.status == "failed"

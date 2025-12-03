@@ -1,0 +1,95 @@
+- name: Setup Certificate Authority
+  hosts: windows
+  gather_facts: no
+  vars:
+    ca_common_name: "RAFAEL-CA"
+    ca_validity_period: 10
+    
+  tasks:
+    - name: Install Active Directory Certificate Services
+      ansible.windows.win_feature:
+        name: ADCS-Cert-Authority
+        include_management_tools: yes
+        include_sub_features: yes
+        state: present
+      register: adcs_install
+
+    - name: Reboot if ADCS installation requires it
+      ansible.windows.win_reboot:
+        reboot_timeout: 300
+      when: adcs_install.reboot_required
+
+    - name: Check if CA is already configured
+      ansible.windows.win_service_info:
+        name: CertSvc
+      register: certsvc_info
+      failed_when: false
+
+
+
+    - name: Configure Enterprise Root Certificate Authority
+      ansible.windows.win_powershell:
+        script: |
+          try {
+            Start-Sleep -Seconds 30
+            Install-AdcsCertificationAuthority -CAType EnterpriseRootCA -Force -Confirm:$false
+            $Ansible.Result = "success"
+          } catch {
+            try {
+              Install-AdcsCertificationAuthority -CAType StandaloneRootCA -Force -Confirm:$false
+              $Ansible.Result = "success_standalone"
+            } catch {
+              $Ansible.Result = "failed"
+            }
+          }
+      when: certsvc_info.services | length == 0 or certsvc_info.services[0].state != "running"
+      register: ca_config
+      async: 600
+      poll: 10
+
+    - name: Start Certificate Authority service
+      ansible.windows.win_service:
+        name: CertSvc
+        state: started
+        start_mode: auto
+
+    - name: Wait for Certificate Authority to be ready
+      ansible.windows.win_service:
+        name: CertSvc
+        state: started
+      register: ca_service
+      until: ca_service is succeeded
+      retries: 10
+      delay: 30
+
+    - name: Verify CA service is running
+      ansible.windows.win_service_info:
+        name: CertSvc
+      register: ca_service_info
+
+    - name: Install CA certificate in Trusted Root store
+      ansible.windows.win_powershell:
+        script: |
+          try {
+            $caCert = Get-ChildItem -Path "Cert:\LocalMachine\My" | Where-Object {$_.Subject -like "*RAFAEL-CA*" -or $_.Subject -like "*rafael*"} | Select-Object -First 1
+            
+            if ($caCert) {
+              $existingRoot = Get-ChildItem -Path "Cert:\LocalMachine\Root" | Where-Object {$_.Thumbprint -eq $caCert.Thumbprint}
+              
+              if (-not $existingRoot) {
+                $tempPath = "C:\temp\ca-cert.cer"
+                Export-Certificate -Cert $caCert -FilePath $tempPath -Force
+                Import-Certificate -FilePath $tempPath -CertStoreLocation "Cert:\LocalMachine\Root"
+                Remove-Item $tempPath -Force
+                $Ansible.Result = "installed"
+              } else {
+                $Ansible.Result = "already_exists"
+              }
+            } else {
+              $Ansible.Result = "ca_not_found"
+            }
+          } catch {
+            $Ansible.Result = "failed"
+          }
+      register: ca_trust_result
+

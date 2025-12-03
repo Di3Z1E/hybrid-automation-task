@@ -1,0 +1,117 @@
+- name: Setup Splunk Universal Forwarder
+  hosts: windows
+  gather_facts: yes
+  vars:
+    splunk_server: "192.168.74.130"
+    splunk_port: 9997
+    forwarder_version: "9.1.2"
+    forwarder_build: "b6b9c8185839"
+    forwarder_url: "https://download.splunk.com/products/universalforwarder/releases/{{ forwarder_version }}/windows/splunkforwarder-{{ forwarder_version }}-{{ forwarder_build }}-x64-release.msi"
+    
+  tasks:
+    - name: Download Splunk Universal Forwarder
+      ansible.windows.win_get_url:
+        url: "{{ forwarder_url }}"
+        dest: C:\temp\splunkforwarder.msi
+        timeout: 600
+        force: no
+
+    - name: Install Splunk Universal Forwarder
+      ansible.windows.win_powershell:
+        script: |
+          $service = Get-Service -Name "SplunkForwarder" -ErrorAction SilentlyContinue
+          if (-not $service) {
+            $msiPath = "C:\temp\splunkforwarder.msi"
+            
+            # Try multiple installation methods
+            $success = $false
+            
+            # Method 1: Standard msiexec
+            try {
+              $args = @("/i", "`"$msiPath`"", "/quiet", "/norestart", "AGREETOLICENSE=yes", "SPLUNKUSERNAME=admin", "SPLUNKPASSWORD=123qweA", "RECEIVING_INDEXER={{ splunk_server }}:{{ splunk_port }}", "LAUNCHSPLUNK=1", "SERVICESTARTTYPE=auto")
+              $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
+              if ($process.ExitCode -eq 0) { $success = $true }
+            } catch {}
+            
+            # Method 2: If first method fails, try without some parameters
+            if (-not $success) {
+              try {
+                $args = @("/i", "`"$msiPath`"", "/quiet", "/norestart", "AGREETOLICENSE=yes")
+                $process = Start-Process -FilePath "msiexec.exe" -ArgumentList $args -Wait -PassThru
+                if ($process.ExitCode -eq 0) { $success = $true }
+              } catch {}
+            }
+            
+            # Wait for installation to complete
+            Start-Sleep -Seconds 60
+            
+            $newService = Get-Service -Name "SplunkForwarder" -ErrorAction SilentlyContinue
+            
+            $Ansible.Result = @{
+              success = $success
+              service_exists = $newService -ne $null
+              service_status = if ($newService) { $newService.Status } else { "not_found" }
+            }
+          } else {
+            $Ansible.Result = @{
+              success = $true
+              service_exists = $true
+              service_status = "already_installed"
+            }
+          }
+      register: splunk_install
+
+    - name: Configure Splunk forwarder
+      ansible.windows.win_powershell:
+        script: |
+          $configDir = "C:\Program Files\SplunkUniversalForwarder\etc\system\local"
+          New-Item -Path $configDir -ItemType Directory -Force
+          
+          $inputsConf = @"
+          [default]
+          host = RAFAELDC
+          
+          [monitor://C:\inetpub\logs\LogFiles\W3SVC1\*.log]
+          disabled = false
+          index = main
+          sourcetype = iis
+          
+          [monitor://C:\Windows\System32\LogFiles\HTTPERR\*.log]
+          disabled = false
+          index = main
+          sourcetype = iis:httperr
+          "@
+          
+          $outputsConf = @"
+          [tcpout]
+          defaultGroup = default-autolb-group
+          
+          [tcpout:default-autolb-group]
+          server = {{ splunk_server }}:{{ splunk_port }}
+          compressed = true
+          "@
+          
+          $inputsConf | Out-File -FilePath "$configDir\inputs.conf" -Encoding UTF8
+          $outputsConf | Out-File -FilePath "$configDir\outputs.conf" -Encoding UTF8
+          
+          $Ansible.Result = "configured"
+
+    - name: Start Splunk Universal Forwarder
+      ansible.windows.win_powershell:
+        script: |
+          $service = Get-Service -Name "SplunkForwarder" -ErrorAction SilentlyContinue
+          if ($service) {
+            try {
+              Start-Service -Name "SplunkForwarder"
+              Set-Service -Name "SplunkForwarder" -StartupType Automatic
+              $Ansible.Result = @{ status = "started"; service_status = (Get-Service -Name "SplunkForwarder").Status }
+            } catch {
+              $Ansible.Result = @{ status = "failed"; error = $_.Exception.Message }
+            }
+          } else {
+            $Ansible.Failed = $true
+            $Ansible.Result = @{ status = "service_not_found" }
+          }
+      register: splunk_service
+      when: splunk_install.result.service_exists
+
